@@ -1,0 +1,5 @@
+{
+  "version": "1.7.0",
+  "download_url": "https://github.com/tworemind-cpu/md_converter/releases/latest",
+  "notes": "인사발령에 해당 없는 그룹 표시 생략, 새로운 버전이 있으면 알려주는 기능 추가"
+}
