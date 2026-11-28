@@ -1,5 +1,5 @@
 {
-  "version": "1.0.1",
+  "version": "1.0.2",
   "download_url": "https://github.com/tworemind-cpu/md_converter/releases/latest",
-  "notes": ""
+  "notes": "- PDF 변환이 되지 않던 오류 수정\n- PDF 변환 속도 대폭 개선 ([빠른 변환] 옵션은 삭제)\n- 새 버전 안내 기능 추가"
 }
