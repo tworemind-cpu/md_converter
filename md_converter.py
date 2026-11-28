@@ -6,18 +6,25 @@ PDF / HWPX → MD 변환기  (진행도 표시 + 속도 개선판)
 - [기존 폴더에 저장하기] : 원본 파일이 있는 폴더에 .md 로 저장
 - [다른 폴더에 저장하기] : 폴더를 선택해서 .md 로 저장
 - 변환 중 진행 팝업: 쪽(페이지) 단위 진행도 + 남은 시간 + [취소]
-- 속도 개선: 여러 파일을 동시에(최대 4개) 변환, [빠른 변환] 옵션
+- 속도: PDF는 여러 쪽 묶음으로 나눠 동시에(최대 4개) 변환
+- 프로그램을 켜면 새 버전이 있는지 확인하고, 있으면 업데이트 안내 팝업을 띄움
+  (인터넷이 막혀 있거나 확인에 실패하면 아무 팝업 없이 조용히 넘어감)
 
 설치:  pip install pymupdf4llm tkinterdnd2
+exe 만들 때:  PyInstaller 옵션에 --collect-all pymupdf --collect-all pymupdf4llm 을 꼭 넣을 것
+             (빠지면 PDF 변환에 필요한 파일이 없어 모든 PDF 변환이 실패함)
 """
 import os
 import sys
+import json
 import queue
 import threading
 import time
 import zipfile
 import re
 import multiprocessing
+import urllib.request
+import webbrowser
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import xml.etree.ElementTree as ET
 import tkinter as tk
@@ -29,7 +36,15 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
+# 현재 프로그램의 버전 (exe를 새로 만들 때마다 이 숫자를 올려주세요)
+CURRENT_VERSION = "1.0.2"
+# 최신 버전 정보(version.json)가 있는 위치
+VERSION_INFO_SOURCE = "https://raw.githubusercontent.com/tworemind-cpu/md_converter/main/version.json"
+UPDATE_TIMEOUT_SEC = 5      # 정보를 읽을 때 기다리는 최대 시간(초)
+
 SUPPORTED = (".pdf", ".hwpx")
+MAX_WORKERS = 4             # 동시에 돌리는 변환 일꾼(프로세스) 수의 상한
+CHUNK_PAGES = 8             # PDF를 일꾼에게 나눠 줄 때 한 묶음의 쪽수
 
 
 class Cancelled(Exception):
@@ -50,49 +65,60 @@ def _init_worker(q, cancel):
 
 
 # ──────────────────────────────────────────────
-# 1) PDF → MD  (쪽마다 변환하면서 진행 상황을 알림)
+# 1) PDF → MD  (쪽 묶음 단위로 변환하면서 진행 상황을 알림)
 # ──────────────────────────────────────────────
-def pdf_to_md(path, idx=None, fast=False):
+def _limit_ai_threads():
+    """배치 분석 AI(onnxruntime)가 CPU를 독차지하지 않게 스레드 수를 제한.
+    기본 설정은 대기 중에도 CPU를 계속 돌려(spinning) 변환이 몇 배 느려짐.
+    pymupdf4llm 을 불러오기 '전에' 실행해야 함. 변환 결과는 달라지지 않음."""
+    import onnxruntime as ort
+    if getattr(ort.InferenceSession, "_limited", False):
+        return
+    threads = 2 if (os.cpu_count() or 2) >= 8 else 1
+    base = ort.InferenceSession
+
+    class LimitedSession(base):
+        _limited = True
+
+        def __init__(self, path, sess_options=None, *args, **kwargs):
+            so = sess_options or ort.SessionOptions()
+            so.intra_op_num_threads = threads
+            so.inter_op_num_threads = 1
+            so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            super().__init__(path, so, *args, **kwargs)
+
+    ort.InferenceSession = LimitedSession
+
+
+def pdf_page_count(path):
+    import pymupdf
+    with pymupdf.open(path) as doc:
+        if doc.needs_pass:
+            raise ValueError("암호가 걸린 PDF입니다")
+        if doc.page_count == 0:
+            raise ValueError("페이지가 없는 PDF입니다")
+        return doc.page_count
+
+
+def pdf_chunk_to_md(path, first, last, idx=None):
+    """first 쪽부터 last 쪽 앞까지(0부터 셈) 변환. (쪽별 글자 목록, 일반 글자로만 된 쪽) 반환"""
     try:
+        _limit_ai_threads()
         import pymupdf4llm
     except ImportError:
         raise RuntimeError("pymupdf4llm 이 설치되지 않았습니다 (pip install pymupdf4llm)")
-    try:
-        import pymupdf
-    except ImportError:
-        import fitz as pymupdf
+    import pymupdf
 
-    doc = pymupdf.open(path)
+    parts = []
     bad_pages = []
-    try:
-        total = doc.page_count
-        if total == 0:
-            raise ValueError("페이지가 없는 PDF입니다")
-
-        hdr = None
-        try:
-            hdr = pymupdf4llm.IdentifyHeaders(doc)
-        except Exception:
-            pass
-
-        parts = []
-        for p in range(total):
+    with pymupdf.open(path) as doc:
+        for p in range(first, last):
             if _mpcancel is not None and _mpcancel.is_set():
                 raise Cancelled()
-
-            # 1단계: 보통 방식 → 2단계: 표·도형 분석 생략 → 3단계: 일반 글자만
-            attempts = []
-            if not fast:
-                attempts.append({"hdr_info": hdr} if hdr else {})
-            attempts.append({"ignore_graphics": True})
-            md = None
-            for kw in attempts:
-                try:
-                    md = pymupdf4llm.to_markdown(doc, pages=[p], show_progress=False, **kw)
-                    break
-                except Exception:
-                    continue
-            if md is None:
+            try:
+                # use_ocr=False : 글자 인식(OCR)은 지원하지 않으므로, 쪽마다 OCR 프로그램을 찾는 시간을 없앰
+                md = pymupdf4llm.to_markdown(doc, pages=[p], show_progress=False, use_ocr=False)
+            except Exception:
                 bad_pages.append(p + 1)
                 try:
                     md = doc[p].get_text("text")
@@ -100,10 +126,12 @@ def pdf_to_md(path, idx=None, fast=False):
                     md = ""
             parts.append(md)
             if _mpq is not None and idx is not None:
-                _mpq.put(("page", idx, p + 1, total))
-    finally:
-        doc.close()
+                _mpq.put(("page", idx))
+    return parts, bad_pages
 
+
+def join_pdf_parts(parts, bad_pages):
+    """쪽별 결과를 하나의 MD 로 합침"""
     md = "\n\n".join(parts)
     if not md or not md.strip():
         raise ValueError("추출된 텍스트가 없습니다 (스캔본·이미지 PDF일 수 있음)")
@@ -224,14 +252,67 @@ def hwpx_to_md(path):
     return md + "\n"
 
 
-def convert_one(idx, path, fast):
-    """일꾼 프로세스가 실행하는 함수 : 파일 1개 변환"""
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".pdf":
-        md = pdf_to_md(path, idx, fast)
-    else:
-        md = hwpx_to_md(path)
-    return idx, md
+def plan_tasks(files):
+    """파일 목록을 일꾼에게 줄 작업으로 나눔.
+    PDF는 CHUNK_PAGES 쪽씩 나누고, HWPX는 파일 하나가 작업 하나.
+    반환: (작업 목록 [(파일 번호, 시작 쪽, 끝 쪽)], 파일별 쪽수, 열 수 없는 파일 {번호: 오류})"""
+    tasks = []
+    pages = {}
+    errors = {}
+    for i, path in enumerate(files):
+        if os.path.splitext(path)[1].lower() != ".pdf":
+            tasks.append((i, None, None))
+            continue
+        try:
+            pages[i] = pdf_page_count(path)
+        except Exception as e:
+            errors[i] = e
+            continue
+        for first in range(0, pages[i], CHUNK_PAGES):
+            tasks.append((i, first, min(first + CHUNK_PAGES, pages[i])))
+    return tasks, pages, errors
+
+
+def convert_task(idx, path, first, last):
+    """일꾼 프로세스가 실행하는 함수 : PDF 쪽 묶음 1개 또는 HWPX 파일 1개 변환"""
+    if first is None:
+        return hwpx_to_md(path)
+    return pdf_chunk_to_md(path, first, last, idx)
+
+
+# ──────────────────────────────────────────────
+# 새 버전 확인
+# ──────────────────────────────────────────────
+def parse_version(text):
+    """'1.2.10' → (1, 2, 10)  (글자 그대로 비교하면 '1.10.0'이 '1.9.0'보다 작게 나옴)"""
+    parts = []
+    for piece in str(text).strip().lstrip("vV").split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def is_newer(latest, current):
+    """latest가 current보다 높은 버전이면 True"""
+    a, b = parse_version(latest), parse_version(current)
+    length = max(len(a), len(b))
+    a += (0,) * (length - len(a))
+    b += (0,) * (length - len(b))
+    return a > b
+
+
+def fetch_version_info(source=VERSION_INFO_SOURCE):
+    """version.json 내용을 읽어 딕셔너리로 돌려줌. 실패하면 None."""
+    try:
+        request = urllib.request.Request(source, headers={"User-Agent": "update-checker"})
+        with urllib.request.urlopen(request, timeout=UPDATE_TIMEOUT_SEC) as response:
+            info = json.loads(response.read().decode("utf-8-sig"))
+        if "version" not in info or "download_url" not in info:
+            return None
+        return info
+    except Exception:
+        # 네트워크 차단, 파일 없음, 형식 오류 등 모든 경우 조용히 넘어감
+        return None
 
 
 # ──────────────────────────────────────────────
@@ -297,6 +378,42 @@ class App:
         self._style()
         self._build()
         self._refresh()
+        self._start_update_check()
+
+    # ----- 새 버전 확인 -----
+    def _start_update_check(self):
+        """뒤에서 조용히 확인 (프로그램이 멈추지 않음)"""
+        result = queue.Queue()
+        threading.Thread(target=lambda: result.put(fetch_version_info()),
+                         daemon=True).start()
+        self.root.after(500, self._poll_update, result, None)
+
+    def _poll_update(self, result, info):
+        # 팝업은 반드시 화면(메인) 쪽에서 띄워야 안전하므로 여기서 결과를 받음
+        if info is None:
+            try:
+                info = result.get_nowait()
+            except queue.Empty:
+                self.root.after(500, self._poll_update, result, None)
+                return
+            if not info or not is_newer(info["version"], CURRENT_VERSION):
+                return
+        if self.busy:       # 변환 중에는 방해하지 않고 끝난 뒤에 안내
+            self.root.after(1000, self._poll_update, result, info)
+            return
+        self._show_update_popup(info)
+
+    def _show_update_popup(self, info):
+        message = ("새 버전이 있습니다.\n\n현재 버전: %s\n최신 버전: %s\n"
+                   % (CURRENT_VERSION, info["version"]))
+        notes = str(info.get("notes", "")).replace("\\n", "\n").strip()
+        if notes:
+            message += "\n[변경 내용]\n%s\n" % notes
+        message += "\n지금 다운로드 페이지를 여시겠습니까?"
+        if messagebox.askyesno("업데이트 안내", message, parent=self.root):
+            url = str(info["download_url"])
+            if url.lower().startswith("https://"):     # 웹 주소만 열기
+                webbrowser.open(url)
 
     # ----- 스타일 -----
     def _style(self):
@@ -314,8 +431,6 @@ class App:
         s.configure("Sub.TLabel", background=self.BG, foreground=self.MUTED)
         s.configure("PopTitle.TLabel", background=self.BG, foreground=self.TEXT,
                     font=(font, 12, "bold"))
-        s.configure("TCheckbutton", background=self.BG, foreground=self.TEXT)
-        s.map("TCheckbutton", background=[("active", self.BG)])
         s.configure("TButton", background="#E5E7EB", foreground=self.TEXT,
                     borderwidth=0, padding=(14, 8))
         s.map("TButton", background=[("active", "#D1D5DB"), ("disabled", "#F3F4F6")],
@@ -382,15 +497,6 @@ class App:
             b.pack(side="left", padx=(0, 8))
         self.count_label = ttk.Label(edit, text="", style="Sub.TLabel")
         self.count_label.pack(side="right")
-
-        # 빠른 변환 옵션
-        opt = ttk.Frame(self.root)
-        opt.pack(fill="x", padx=24, pady=(10, 0))
-        self.fast_var = tk.BooleanVar(value=False)
-        self.chk_fast = ttk.Checkbutton(
-            opt, text="빠른 변환 (PDF의 표·도형 분석을 생략합니다. 표가 글자로만 나올 수 있어요)",
-            variable=self.fast_var)
-        self.chk_fast.pack(side="left")
 
         # 저장 버튼
         act = ttk.Frame(self.root)
@@ -501,7 +607,7 @@ class App:
         self._refresh()
 
     # ----- 진행 팝업 -----
-    def _open_popup(self, total, workers):
+    def _open_popup(self, total):
         pop = tk.Toplevel(self.root)
         self.pop = pop
         pop.title("변환 진행 중")
@@ -522,10 +628,7 @@ class App:
         body = ttk.Frame(pop)
         body.pack(fill="both", expand=True, padx=24, pady=20)
 
-        title = "변환하는 중입니다…"
-        if workers > 1:
-            title += "  (동시에 %d개씩 처리)" % workers
-        self.pop_title = ttk.Label(body, text=title, style="PopTitle.TLabel")
+        self.pop_title = ttk.Label(body, text="변환하는 중입니다…", style="PopTitle.TLabel")
         self.pop_title.pack(anchor="w")
 
         self.pop_file = ttk.Label(body, text="파일을 여는 중…", style="Sub.TLabel")
@@ -605,7 +708,7 @@ class App:
         self.busy = busy
         state = "disabled" if busy else "normal"
         for b in (self.btn_add, self.btn_del, self.btn_clear, self.btn_same,
-                  self.btn_other, self.chk_fast):
+                  self.btn_other):
             b.configure(state=state)
 
     def start(self, mode):
@@ -620,8 +723,6 @@ class App:
             if not folder:
                 return
         files = list(self.files)
-        fast = bool(self.fast_var.get())
-        workers = max(1, min(4, (os.cpu_count() or 2) - 1, len(files)))
 
         self.total = len(files)
         self.part = {}
@@ -635,48 +736,81 @@ class App:
         self.start_time = time.time()
         self.progress.configure(maximum=self.SCALE, value=0)
         self._set_busy(True)
-        self.write_log("─ 변환 시작 (%d개%s) ─" % (len(files), ", 빠른 변환" if fast else ""))
-        self._open_popup(len(files), workers)
-        threading.Thread(target=self._worker, args=(files, folder, fast, workers),
+        self.write_log("─ 변환 시작 (%d개) ─" % len(files))
+        self._open_popup(len(files))
+        threading.Thread(target=self._worker, args=(files, folder),
                          daemon=True).start()
         self.root.after(100, self._poll)
 
-    def _drain(self):
-        """일꾼 프로세스가 보낸 쪽 진행 상황을 화면용 큐로 옮김"""
+    def _drain(self, pages, page_done):
+        """일꾼 프로세스가 보낸 쪽 진행 상황을 세어 화면용 큐로 옮김"""
         while True:
             try:
-                kind, idx, cur, tot = self.mpq.get_nowait()
+                _, idx = self.mpq.get_nowait()
             except queue.Empty:
                 break
-            self.q.put(("page", (idx, cur, tot)))
+            page_done[idx] = page_done.get(idx, 0) + 1
+            self.q.put(("page", (idx, page_done[idx], pages[idx])))
 
-    def _worker(self, files, folder, fast, workers):
+    def _worker(self, files, folder):
         used = set()
         ok = fail = 0
         cancelled = False
+        pages, page_done = {}, {}
+
+        def report_fail(i, e):
+            name = os.path.basename(files[i])
+            self.q.put(("log", "✘ %s : %s: %s" % (name, type(e).__name__, e)))
+            self.q.put(("filedone", (i, name)))
+
         try:
+            tasks, pages, errors = plan_tasks(files)
+            for i, e in errors.items():
+                report_fail(i, e)
+                fail += 1
+
+            left = {}       # 파일 번호 → 남은 작업 수
+            for i, _, _ in tasks:
+                left[i] = left.get(i, 0) + 1
+            results = {}    # 파일 번호 → {시작 쪽: 결과}
+            failed = set()
+
+            workers = max(1, min(MAX_WORKERS, (os.cpu_count() or 2) - 1, len(tasks)))
             with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker,
                                      initargs=(self.mpq, self.mpcancel)) as ex:
-                futs = {ex.submit(convert_one, i, p, fast): (i, p)
-                        for i, p in enumerate(files)}
+                futs = {ex.submit(convert_task, i, files[i], first, last): (i, first)
+                        for i, first, last in tasks}
                 pending = set(futs)
                 while pending:
-                    self._drain()
+                    self._drain(pages, page_done)
                     done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
 
                     if self.cancel_event.is_set() and not cancelled:
                         cancelled = True
                         self.mpcancel.set()
                         for f in list(pending):
-                            f.cancel()      # 아직 시작 안 한 파일은 취소
+                            f.cancel()      # 아직 시작 안 한 작업은 취소
 
                     for f in done:
-                        i, path = futs[f]
-                        name = os.path.basename(path)
-                        if f.cancelled():
+                        i, first = futs[f]
+                        if f.cancelled() or i in failed:
                             continue
+                        path = files[i]
+                        name = os.path.basename(path)
                         try:
-                            _, md = f.result()
+                            results.setdefault(i, {})[first] = f.result()
+                            left[i] -= 1
+                            if left[i]:
+                                continue    # 이 파일의 다른 묶음이 남음
+                            got = results.pop(i)
+                            if first is None:
+                                md = got[None]
+                            else:
+                                parts, bad = [], []
+                                for key in sorted(got):
+                                    parts += got[key][0]
+                                    bad += got[key][1]
+                                md = join_pdf_parts(parts, bad)
                             outdir = folder if folder else os.path.dirname(path)
                             stem = os.path.splitext(name)[0]
                             out = unique_path(outdir, stem, used)
@@ -684,15 +818,20 @@ class App:
                                 fp.write(md)
                             self.q.put(("log", "✔ %s → %s" % (name, out)))
                             ok += 1
+                            self.q.put(("filedone", (i, name)))
                         except Cancelled:
                             continue
                         except Exception as e:
-                            self.q.put(("log", "✘ %s : %s: %s" % (name, type(e).__name__, e)))
+                            failed.add(i)
+                            results.pop(i, None)
+                            for other in pending:
+                                if futs[other][0] == i:
+                                    other.cancel()
+                            report_fail(i, e)
                             fail += 1
-                        self.q.put(("filedone", (i, name)))
         except Exception as e:
             self.q.put(("log", "✘ 변환 엔진 오류: %s" % e))
-        self._drain()
+        self._drain(pages, page_done)
         self.q.put(("done", (ok, fail, cancelled, len(files) - ok - fail)))
 
     def _poll(self):
